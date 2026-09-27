@@ -1,0 +1,21 @@
+{
+  "name": "coastal-survey-coverage-certifier",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "海岸遗址航拍覆盖认证：凸多边形工作区 + 旋转矩形覆盖带的连续平面判定（无栅格/无采样）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "node --test",
+    "smoke": "node scripts/smoke.mjs",
+    "verify": "node scripts/verify.mjs"
+  },
+  "dependencies": {
+    "decimal.js": "^10.4.3"
+  },
+  "devDependencies": {
+    "vite": "^5.4.8"
+  }
+}

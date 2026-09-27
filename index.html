@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>海岸遗址航拍覆盖认证</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>海岸遗址航拍覆盖认证</h1>
+        <p class="subtitle">凸多边形工作区 × 旋转矩形覆盖带 · 连续平面判定（无栅格 / 无采样）</p>
+      </div>
+      <span id="statusBadge" class="badge badge-idle">未认证</span>
+    </header>
+
+    <main>
+      <section class="panel" id="inputPanel">
+        <h2>① 草稿录入</h2>
+        <div class="field">
+          <label>工作区顶点（每行一个 <code>x, y</code>，逆时针）</label>
+          <textarea id="workareaInput" rows="5" spellcheck="false"></textarea>
+        </div>
+        <div class="field">
+          <div class="row space-between">
+            <label>覆盖带（3–12 条，整数参数）</label>
+            <button id="addStripBtn" type="button" class="btn-small">＋ 添加</button>
+          </div>
+          <table class="strip-table">
+            <thead>
+              <tr><th>#</th><th>cx</th><th>cy</th><th>w</th><th>h</th><th>角度°</th><th></th></tr>
+            </thead>
+            <tbody id="stripRows"></tbody>
+          </table>
+        </div>
+        <div class="field">
+          <label>示例场景</label>
+          <div id="sampleButtons" class="row wrap"></div>
+        </div>
+        <button id="certifyBtn" type="button" class="primary">发起认证</button>
+        <p id="formMsg" class="msg"></p>
+      </section>
+
+      <section class="panel" id="planPanel">
+        <h2>② 平面图</h2>
+        <canvas id="planCanvas" width="640" height="640"></canvas>
+        <div id="legend" class="legend"></div>
+      </section>
+
+      <section class="panel" id="detailPanel">
+        <h2>③ 认证明细</h2>
+        <div id="reportView"><p class="muted">尚未发起认证。</p></div>
+        <h3>覆盖带明细</h3>
+        <div id="stripDetail"></div>
+      </section>
+    </main>
+
+    <footer>
+      <span id="footNote">判定在本地浏览器内完成；边界接触计入覆盖；禁止栅格化与固定采样。</span>
+    </footer>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

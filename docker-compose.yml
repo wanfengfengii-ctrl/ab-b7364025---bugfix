@@ -1,0 +1,26 @@
+# 海岸遗址航拍覆盖认证
+#   web     静态前端（nginx），宿主机端口由 WEB_PORT 配置（默认 8080）
+#   verify  一次性服务：代码测试 + 前端构建 + 冒烟，自行退出并以退出码报告结果
+
+services:
+  web:
+    build:
+      context: .
+      target: web
+    image: coastal-survey-web:1.0.0
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  verify:
+    build:
+      context: .
+      target: verify
+    image: coastal-survey-verify:1.0.0
+    # 一次性任务：运行 scripts/verify.mjs 后自行退出，退出码即验证结论
+    restart: "no"
