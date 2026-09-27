@@ -227,65 +227,309 @@ export function certify(input) {
   }
   if (vertexMax > stats.maxMultiplicity) stats.maxMultiplicity = vertexMax;
 
-  // 5) 边界证据：单元边 ↔ 边线归属匹配
-  const allLines = [...stripLines, ...waLines];
+  // 5) 连通风险区域归并
+  // 半平面剖分会把一块几何上连通的同类区域（如被第三条带切去一角的 L 形
+  // 漏拍区域）切成多个凸单元；逐单元报告会把同一块连续未拍地带拆成多个风险，
+  // 且内部切分线会被误当作边界证据。这里把「类别相同、覆盖情形相同，且沿
+  // 正长度公共边相接」的单元并为一个连通区域：仅以顶点相接（点接触）的区域
+  // 不合并，彼此独立的漏拍/三重区域仍分别报告。
   const ownerLabel = (o) => (o.workarea ? `工作区·边${o.edge + 1}` : `R${o.strip}·${o.side}`);
-  function boundaryOf(verts) {
+
+  // 边界证据按「实际边段」而非无限直线匹配：只有与风险外边界存在正长度重合
+  // 的工作区边/覆盖带边才计入，避免共线延长线（如仅端点相接）混入证据。
+  const ownerSegments = [];
+  waLines.forEach((L) => {
+    const i = L.owners[0].edge;
+    ownerSegments.push({ a: workarea[i], b: workarea[(i + 1) % workarea.length], label: ownerLabel(L.owners[0]) });
+  });
+  strips.forEach((s, si) => {
+    s.edges.forEach((_, k) => {
+      ownerSegments.push({ a: s.corners[k], b: s.corners[(k + 1) % 4], label: ownerLabel({ strip: si + 1, side: SIDE_NAMES[k] }) });
+    });
+  });
+
+  const segTol = D('1e-12').mul(S).mul(S); // 共线判定容差（叉积量级）
+  /** 点 m 是否落在线段 a→b 上（含端点，闭集） */
+  function pointOnSegment(m, a, b) {
+    const abx = b.x.minus(a.x);
+    const aby = b.y.minus(a.y);
+    const amx = m.x.minus(a.x);
+    const amy = m.y.minus(a.y);
+    const cross = abx.mul(amy).minus(aby.mul(amx));
+    if (cross.abs().gt(segTol)) return false;
+    const len2 = abx.mul(abx).plus(aby.mul(aby));
+    if (len2.lte(EPS.mul(EPS))) return false;
+    const t = abx.mul(amx).plus(aby.mul(amy)).div(len2);
+    return t.gte(0) && t.lte(1);
+  }
+  /** 两条共线线段是否存在正长度重合（重合长度 > lineTol） */
+  function segmentsOverlap(a, b, c, d) {
+    const abx = b.x.minus(a.x);
+    const aby = b.y.minus(a.y);
+    const cross = abx.mul(d.y.minus(c.y)).minus(aby.mul(d.x.minus(c.x)));
+    if (cross.abs().gt(segTol)) return false;
+    // 平行之外还须共线：c 到直线 ab 的距离（叉积）须近似为 0
+    const dist = abx.mul(c.y.minus(a.y)).minus(aby.mul(c.x.minus(a.x)));
+    if (dist.abs().gt(segTol)) return false;
+    const len2 = abx.mul(abx).plus(aby.mul(aby));
+    const along = (p) => abx.mul(p.x.minus(a.x)).plus(aby.mul(p.y.minus(a.y)));
+    const t1 = along(c);
+    const t2 = along(d);
+    // [0,len2] ∩ [min(t1,t2),max(t1,t2)] 的有向长度
+    const overlap = Decimal.min(len2, Decimal.max(t1, t2)).minus(Decimal.max(0, Decimal.min(t1, t2)));
+    return overlap.gt(lineTol);
+  }
+  function pointEvidence(p) {
     const labels = new Set();
-    for (let i = 0; i < verts.length; i++) {
-      const p = verts[i];
-      const q = verts[(i + 1) % verts.length];
-      const len2 = p.x.minus(q.x).pow(2).plus(p.y.minus(q.y).pow(2));
-      if (len2.lte(lineTol.mul(lineTol))) continue;
-      for (const L of allLines) {
-        if (lineValue(L, p).abs().lte(lineTol) && lineValue(L, q).abs().lte(lineTol)) {
-          for (const o of L.owners) labels.add(ownerLabel(o));
+    for (const seg of ownerSegments) {
+      if (pointOnSegment(p, seg.a, seg.b)) labels.add(seg.label);
+    }
+    return [...labels];
+  }
+  const regionItems = [];
+  for (const c of gapCells) regionItems.push({ cell: c, kind: 'gap', sig: '' });
+  for (const c of tripleCells) regionItems.push({ cell: c, kind: 'triple', sig: c.covering.join('>') });
+
+  // 并查集：沿公共边合并同类同覆盖情形的单元
+  const parent = regionItems.map((_, i) => i);
+  const find = (i) => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+  const union = (i, j) => { parent[find(i)] = find(j); };
+
+  // 顶点键 → 落在该顶点上的风险单元下标（空间索引，把候选限制为相邻单元）
+  const vtxCells = new Map();
+  const cellEdges = regionItems.map((it, i) => {
+    const verts = it.cell.vertices;
+    const edges = [];
+    for (let k = 0; k < verts.length; k++) {
+      const a = verts[k];
+      const b = verts[(k + 1) % verts.length];
+      if (a.x.minus(b.x).pow(2).plus(a.y.minus(b.y).pow(2)).lte(lineTol.mul(lineTol))) continue;
+      const e = { a, b, ak: vtxKey(a), bk: vtxKey(b) };
+      edges.push(e);
+      if (!vtxCells.has(e.ak)) vtxCells.set(e.ak, []);
+      if (!vtxCells.has(e.bk)) vtxCells.set(e.bk, []);
+      vtxCells.get(e.ak).push(i);
+      vtxCells.get(e.bk).push(i);
+    }
+    return edges;
+  });
+
+  /** 两同类风险单元是否沿正长度公共边相接（候选对来自共享顶点索引） */
+  function shareEdge(i, j) {
+    const ai = regionItems[i];
+    const bi = regionItems[j];
+    if (ai.kind !== bi.kind || ai.sig !== bi.sig) return false;
+    for (const ea of cellEdges[i]) {
+      const mid = { x: ea.a.x.plus(ea.b.x).div(2), y: ea.a.y.plus(ea.b.y).div(2) };
+      for (const eb of cellEdges[j]) {
+        // 完整共享边：端点键相同（正反向均可）
+        if ((ea.ak === eb.ak && ea.bk === eb.bk) || (ea.ak === eb.bk && ea.bk === eb.ak)) return true;
+        // T 形相接：一条边中点落在另一条边上（非端点的正长度重合）
+        if (pointOnSegment(mid, eb.a, eb.b)) return true;
+      }
+    }
+    return false;
+  }
+
+  // 共享顶点的同类候选对若沿正长度公共边相接则合并（仅点相接不会通过）
+  const seen = new Set();
+  for (const [, cellIdxs] of vtxCells) {
+    for (let x = 0; x < cellIdxs.length; x++) {
+      for (let y = x + 1; y < cellIdxs.length; y++) {
+        const i = Math.min(cellIdxs[x], cellIdxs[y]);
+        const j = Math.max(cellIdxs[x], cellIdxs[y]);
+        const key = i * regionItems.length + j;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (shareEdge(i, j)) union(i, j);
+      }
+    }
+  }
+
+  const groupsMap = new Map();
+  regionItems.forEach((it, i) => {
+    const root = find(i);
+    if (!groupsMap.has(root)) groupsMap.set(root, []);
+    groupsMap.get(root).push(it);
+  });
+
+  /**
+   * 提取连通区域的外边界环（CCW 点环，可能为凹多边形）：
+   * 溶解所有组内两单元共享（正反向出现两次）或被 T 形分割的内部公共边，
+   * 剩余有向外边逐段首尾相接成环，并返回保留下来的外部边供边界证据标注。
+   */
+  function regionOutline(items) {
+    const cells = items.map((it) => it.cell);
+    const pointMap = new Map();
+    const cacheP = (p) => { const k = vtxKey(p); if (!pointMap.has(k)) pointMap.set(k, p); return k; };
+    const edges = []; // {ak,bk,a,b,ci}
+    cells.forEach((c, ci) => {
+      let verts = c.vertices;
+      if (signedArea(verts).isNegative()) verts = [...verts].reverse();
+      for (let k = 0; k < verts.length; k++) {
+        const a = verts[k];
+        const b = verts[(k + 1) % verts.length];
+        if (a.x.minus(b.x).pow(2).plus(a.y.minus(b.y).pow(2)).lte(lineTol.mul(lineTol))) continue;
+        edges.push({ ak: cacheP(a), bk: cacheP(b), a, b, ci });
+      }
+    });
+    // 无向边键 → 出现次数：两单元沿同一正反向边相接时出现两次 ⇒ 内部边
+    const undir = (ak, bk) => (ak < bk ? `${ak}|${bk}` : `${bk}|${ak}`);
+    const keyCount = new Map();
+    const vtxEdge = new Map(); // 顶点键 → 边下标（T 形相接的局部候选）
+    edges.forEach((e, idx) => {
+      const uk = undir(e.ak, e.bk);
+      keyCount.set(uk, (keyCount.get(uk) ?? 0) + 1);
+      for (const vk of [e.ak, e.bk]) {
+        if (!vtxEdge.has(vk)) vtxEdge.set(vk, []);
+        vtxEdge.get(vk).push(idx);
+      }
+    });
+    const kept = [];
+    for (const e of edges) {
+      if ((keyCount.get(undir(e.ak, e.bk)) ?? 0) >= 2) continue; // 完整共享边：内部
+      // T 形相接回退：边中点落在同组另一条边（端点键不同但正长度重合）上
+      const mid = { x: e.a.x.plus(e.b.x).div(2), y: e.a.y.plus(e.b.y).div(2) };
+      let internal = false;
+      const cand = new Set();
+      for (const vk of [e.ak, e.bk]) for (const idx of vtxEdge.get(vk) ?? []) cand.add(idx);
+      for (const idx of cand) {
+        const f = edges[idx];
+        if (f.ci === e.ci) continue;
+        if (pointOnSegment(mid, f.a, f.b)) { internal = true; break; }
+      }
+      if (!internal) kept.push(e);
+    }
+    // 有向外边首尾相接成环
+    const outgoing = new Map();
+    for (const idx of kept.keys()) {
+      const e = kept[idx];
+      if (!outgoing.has(e.ak)) outgoing.set(e.ak, []);
+      outgoing.get(e.ak).push(idx);
+    }
+    const used = new Set();
+    const rings = [];
+    for (const start of kept.keys()) {
+      if (used.has(start)) continue;
+      let e = kept[start];
+      const keys = [e.ak, e.bk];
+      used.add(start);
+      for (;;) {
+        const nexts = outgoing.get(e.bk)?.filter((idx) => !used.has(idx)) ?? [];
+        if (!nexts.length) break;
+        const idx = nexts[0];
+        used.add(idx);
+        e = kept[idx];
+        if (e.bk === keys[0]) break;
+        keys.push(e.bk);
+        if (keys.length > edges.length + 1) break; // 防御性上限
+      }
+      const ring = keys.map((k) => pointMap.get(k));
+      if (ring.length >= 3) rings.push(ring);
+    }
+    // 面积最大者作为代表外边界环（孔洞环等仅参与证据与字典序）
+    rings.sort((r1, r2) => signedArea(r2).abs().cmp(signedArea(r1).abs()));
+    return { rings, kept };
+  }
+
+  // 归属边段按「法向方向 + 偏移量化」两级分桶：单元边必落在某条覆盖带边线/
+  // 工作区边线上。方向键取 float64 量化单位法向；偏移 c 按 1e-8 分桶，查询时
+  // 兼查相邻三桶以吸收不同来源端点的舍入差；最终仍由 Decimal 段重合精确判定。
+  // 桶键：单位法向整数对 (qn(nx),qn(ny)) → 偏移整数 cq → 归属边段
+  const dirBuckets = new Map();
+  const QN = 1e8;
+  const QC = 1e8;
+  const lineKeys = (a, b) => {
+    const dx = b.x.toNumber() - a.x.toNumber();
+    const dy = b.y.toNumber() - a.y.toNumber();
+    const len = Math.hypot(dx, dy) || 1;
+    let nx = -dy / len;
+    let ny = dx / len;
+    let c = nx * a.x.toNumber() + ny * a.y.toNumber();
+    if (nx < -1e-9 || (Math.abs(nx) <= 1e-9 && ny < 0)) { nx = -nx; ny = -ny; c = -c; }
+    return { qx: Math.round(nx * QN), qy: Math.round(ny * QN), cq: Math.round(c * QC) };
+  };
+  for (const seg of ownerSegments) {
+    const { qx, qy, cq } = lineKeys(seg.a, seg.b);
+    const dir = `${qx},${qy}`;
+    if (!dirBuckets.has(dir)) dirBuckets.set(dir, new Map());
+    const cmap = dirBuckets.get(dir);
+    if (!cmap.has(cq)) cmap.set(cq, []);
+    cmap.get(cq).push(seg);
+  }
+
+  /** 外边界边 ↔ 实际边段归属匹配：只标注与连通区域外边存在正长度重合的边 */
+  function boundaryEvidence(kept) {
+    const labels = new Set();
+    for (const e of kept) {
+      const { qx, qy, cq } = lineKeys(e.a, e.b);
+      // 兼查方向/偏移相邻桶（3×3），量化边界绝不漏候选；误候选由 Decimal 精确排除
+      for (let dxk = -1; dxk <= 1; dxk++) {
+        for (let dyk = -1; dyk <= 1; dyk++) {
+          const cmap = dirBuckets.get(`${qx + dxk},${qy + dyk}`);
+          if (!cmap) continue;
+          for (const dq of [-1, 0, 1]) {
+            for (const seg of cmap.get(cq + dq) ?? []) {
+              if (segmentsOverlap(e.a, e.b, seg.a, seg.b)) labels.add(seg.label);
+            }
+          }
         }
       }
     }
     return [...labels];
   }
-  function pointEvidence(p) {
-    const labels = new Set();
-    for (const L of allLines) {
-      if (lineValue(L, p).abs().lte(lineTol)) for (const o of L.owners) labels.add(ownerLabel(o));
-    }
-    return [...labels];
-  }
 
-  // 6) 风险区域汇总
   const num = (d) => d.toNumber();
-  const vertsOf = (c) => c.vertices.map((p) => [num(p.x), num(p.y)]);
-  const risks = [];
-  gapCells.forEach((c, i) => {
-    risks.push({
-      id: `G${i + 1}`,
-      kind: 'gap',
+  const numPts = (ring) => ring.map((p) => [num(p.x), num(p.y)]);
+  const lexMinOfRings = (rings) => {
+    let mx = Infinity, my = Infinity;
+    for (const ring of rings) for (const p of ring) {
+      const x = num(p.x), y = num(p.y);
+      if (x < mx - 1e-12 || (Math.abs(x - mx) <= 1e-12 && y < my)) { mx = x; my = y; }
+    }
+    return [mx, my];
+  };
+
+  // 6) 风险区域汇总（连通区域 → 一项风险；零面积接触点独立报告）
+  const buildRegionRisk = (items) => {
+    const kind = items[0].kind;
+    let area = new Decimal(0);
+    for (const it of items) area = area.plus(it.cell.area);
+    const { rings, kept } = regionOutline(items);
+    // 代表点取面积最大组成单元的质心：保证落在区域内部（加权质心在有孔洞时可能落入孔洞）
+    let repCell = items[0].cell;
+    for (const it of items) if (it.cell.area.gt(repCell.area)) repCell = it.cell;
+    const rep = [num(repCell.centroid.x), num(repCell.centroid.y)];
+    return {
+      kind,
       shape: 'region',
-      multiplicity: 0,
-      area: num(c.area),
-      representative: [num(c.centroid.x), num(c.centroid.y)],
-      vertices: vertsOf(c),
-      boundary: boundaryOf(c.vertices),
-      strips: [],
-    });
-  });
-  tripleCells.forEach((c, i) => {
-    risks.push({
-      id: `T${i + 1}`,
-      kind: 'triple',
-      shape: 'region',
-      multiplicity: c.count,
-      area: num(c.area),
-      representative: [num(c.centroid.x), num(c.centroid.y)],
-      vertices: vertsOf(c),
-      boundary: boundaryOf(c.vertices),
-      strips: c.covering,
-    });
-  });
-  contacts.forEach((ct, i) => {
+      multiplicity: kind === 'gap' ? 0 : items[0].cell.count,
+      area: num(area),
+      representative: rep,
+      // vertices：连通区域外边界环（凹多边形；含孔洞时仅外环，孔洞靠 parts 渲染）
+      vertices: rings.length ? numPts(rings[0]) : numPts(items[0].cell.vertices),
+      // parts：组成该连通区域的全部凸单元（铺满实际区域，孔洞自然不填充）
+      parts: items.map((it) => numPts(it.cell.vertices)),
+      boundary: boundaryEvidence(kept),
+      strips: kind === 'gap' ? [] : items[0].cell.covering,
+      lex: lexMinOfRings(rings.length ? rings : [items[0].cell.vertices]),
+    };
+  };
+
+  const groups = [...groupsMap.values()];
+  const gapRisks = groups
+    .filter((items) => items[0].kind === 'gap')
+    .map((items) => buildRegionRisk(items))
+    .sort((a, b) => a.lex[0] - b.lex[0] || a.lex[1] - b.lex[1])
+    .map((r, i) => ({ ...r, id: `G${i + 1}` }));
+  const tripleRegionRisks = groups
+    .filter((items) => items[0].kind === 'triple')
+    .map((items) => buildRegionRisk(items))
+    .sort((a, b) => a.lex[0] - b.lex[0] || a.lex[1] - b.lex[1])
+    .map((r, i) => ({ ...r, id: `T${i + 1}` }));
+  const pointRisks = contacts.map((ct, i) => {
     const p = [num(ct.point.x), num(ct.point.y)];
-    risks.push({
+    return {
       id: `P${i + 1}`,
       kind: 'triple',
       shape: 'point',
@@ -295,30 +539,19 @@ export function certify(input) {
       vertices: [p],
       boundary: pointEvidence(ct.point),
       strips: ct.covering,
-    });
+      lex: p,
+    };
   });
+  const tripleRisks = [...tripleRegionRisks, ...pointRisks]
+    .sort((a, b) => a.lex[0] - b.lex[0] || a.lex[1] - b.lex[1]);
 
-  // 首个风险区域：漏拍优先于三重曝光，再按最小顶点字典序（x 小者优先，再 y）
-  const lexMin = (verts) => {
-    let mx = Infinity;
-    let my = Infinity;
-    for (const [x, y] of verts) {
-      if (x < mx - 1e-12 || (Math.abs(x - mx) <= 1e-12 && y < my)) { mx = x; my = y; }
-    }
-    return [mx, my];
-  };
-  const kindOrder = { gap: 0, triple: 1 };
-  const sorted = [...risks].sort((a, b) => {
-    if (kindOrder[a.kind] !== kindOrder[b.kind]) return kindOrder[a.kind] - kindOrder[b.kind];
-    const ka = lexMin(a.vertices);
-    const kb = lexMin(b.vertices);
-    return ka[0] - kb[0] || ka[1] - kb[1];
-  });
+  // 首个风险区域：漏拍优先于三重曝光，同类按最小顶点字典序（x 小者优先，再 y）
+  const sorted = [...gapRisks, ...tripleRisks];
   const firstRisk = sorted[0] ?? null;
 
   const coveredArea = stats.workArea.minus(stats.gapArea);
   const report = {
-    ok: risks.length === 0,
+    ok: sorted.length === 0,
     errors: [],
     stats: {
       stripCount: stats.stripCount,
@@ -335,8 +568,8 @@ export function certify(input) {
     },
     firstRisk,
     risks: sorted,
-    gaps: sorted.filter((r) => r.kind === 'gap'),
-    triples: sorted.filter((r) => r.kind === 'triple'),
+    gaps: gapRisks,
+    triples: tripleRisks,
     // 渲染与明细数据
     workarea: input.workarea.map(([x, y]) => [x, y]),
     strips: strips.map((s) => ({
@@ -345,7 +578,11 @@ export function certify(input) {
       corners: s.corners.map((p) => [num(p.x), num(p.y)]),
       area: s.params.w * s.params.h,
     })),
-    cells: cellRecs.map((c) => ({ vertices: vertsOf(c), count: c.count })),
+    cells: cellRecs.map((c) => ({
+      vertices: c.vertices.map((p) => [num(p.x), num(p.y)]),
+      count: c.count,
+    })),
   };
+  for (const r of report.risks) delete r.lex;
   return report;
 }

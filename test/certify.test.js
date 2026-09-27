@@ -142,7 +142,7 @@ describe('合格认证', () => {
 });
 
 describe('漏拍风险', () => {
-  test('竖直漏拍带（含 L 形细分）面积精确', () => {
+  test('L 形连通漏拍区作为一项完整风险：面积 164，边界证据只含实际外边界', () => {
     const r = certify({ workarea: square(), strips: [
       { cx: 6, cy: 15, w: 16, h: 34, angle: 0 },
       { cx: 26, cy: 15, w: 12, h: 34, angle: 0 },
@@ -150,10 +150,54 @@ describe('漏拍风险', () => {
     ]});
     assert.equal(r.ok, false);
     assert.ok(Math.abs(r.stats.gapArea - 164) < 1e-6); // 6*30 - 4*4
+    // 被内部边线切开的三块同属一个连通 L 形区域 → 仅一项漏拍风险
+    assert.equal(r.gaps.length, 1);
+    assert.equal(r.risks.length, 1);
     assert.equal(r.firstRisk.kind, 'gap');
-    assert.ok(Math.abs(r.firstRisk.area - 104) < 1e-6); // 首个（最大）漏拍单元
+    assert.ok(Math.abs(r.firstRisk.area - 164) < 1e-6);
+    // L 形八个角点（凹多边形，非任一剖分单元）
+    assert.equal(r.firstRisk.vertices.length, 8);
+    // 边界证据只反映 L 形实际外边界
     assert.ok(r.firstRisk.boundary.includes('R1·右边'));
-    assert.ok(r.firstRisk.vertices.length >= 3);
+    assert.ok(r.firstRisk.boundary.includes('R2·左边'));
+    assert.ok(r.firstRisk.boundary.includes('R3·底边'));
+    assert.ok(r.firstRisk.boundary.includes('R3·右边'));
+    assert.ok(r.firstRisk.boundary.includes('工作区·边1')); // 工作区底边
+    assert.ok(r.firstRisk.boundary.includes('工作区·边3')); // 工作区顶边
+    // 内部切分线与非实际外边界不得出现：
+    // R3·顶边 y=30 只在角点 (18,30) 与 L 形相接，无正长度重合
+    assert.ok(!r.firstRisk.boundary.includes('R3·顶边'));
+    // R3·左边 x=12 在 R1 覆盖内部，不是漏拍区边界
+    assert.ok(!r.firstRisk.boundary.includes('R3·左边'));
+  });
+
+  test('彼此分离的漏拍区域仍分别报告为多项风险', () => {
+    // 仅覆盖中央横带，上下各留一块互不连通的漏拍区
+    const r = certify({ workarea: square(), strips: [
+      { cx: 15, cy: 15, w: 34, h: 10, angle: 0 },
+      { cx: 15, cy: 15, w: 34, h: 10, angle: 0 },
+      { cx: 100, cy: 100, w: 2, h: 2, angle: 0 },
+    ]});
+    assert.equal(r.ok, false);
+    assert.equal(r.gaps.length, 2);
+    assert.ok(Math.abs(r.stats.gapArea - 600) < 1e-6); // 两块各 300
+    for (const g of r.gaps) assert.ok(Math.abs(g.area - 300) < 1e-6);
+    assert.equal(r.firstRisk.kind, 'gap');
+  });
+
+  test('仅在顶点处相接的两块漏拍区（点接触）不合并', () => {
+    // R1 覆盖右下角 [4,10]×[0,4]，R2 覆盖左上角 [0,4]×[4,10]，
+    // 两块漏拍区 [0,4]×[0,4] 与 [4,10]×[4,10] 的闭包只在 (4,4) 一点相接。
+    const r = certify({ workarea: [[0, 0], [10, 0], [10, 10], [0, 10]], strips: [
+      { cx: 7, cy: 2, w: 6, h: 4, angle: 0 },
+      { cx: 2, cy: 7, w: 4, h: 6, angle: 0 },
+      { cx: 50, cy: 50, w: 2, h: 2, angle: 0 },
+    ]});
+    assert.equal(r.ok, false);
+    assert.equal(r.gaps.length, 2);
+    assert.ok(Math.abs(r.stats.gapArea - 52) < 1e-6); // 16 + 36，仅点 (4,4) 相接
+    const areas = r.gaps.map((g) => g.area).sort((a, b) => a - b);
+    assert.deepEqual(areas, [16, 36]);
   });
 
   test('完全无覆盖：整个工作区即漏拍区', () => {
@@ -164,7 +208,9 @@ describe('漏拍风险', () => {
     ]});
     assert.equal(r.ok, false);
     assert.ok(Math.abs(r.stats.gapArea - 900) < 1e-6);
+    assert.equal(r.gaps.length, 1);
     assert.equal(r.firstRisk.kind, 'gap');
+    assert.ok(Math.abs(r.firstRisk.area - 900) < 1e-6);
   });
 
   test('旋转 1° 整数参数造成的 ~0.02 窄缝必须被连续判定发现', () => {

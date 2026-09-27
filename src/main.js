@@ -218,11 +218,13 @@ function renderPlan(scene, report = null) {
     ctx.fillText(`R${i + 1}`, X(cx) - 8, Y(cy) + 4);
   });
 
-  // 风险区域（认证后）
+  // 风险区域（认证后）：按连通区域的凸单元铺满填充（孔洞自然留空），
+  // 再沿外边界环描边
   if (report) {
     for (const r of report.risks) {
       if (r.shape !== 'region') continue;
-      drawPoly(r.vertices);
+      const parts = r.parts?.length ? r.parts : [r.vertices];
+      for (const verts of parts) drawPoly(verts);
       if (r.kind === 'gap') {
         ctx.fillStyle = 'rgba(239, 95, 107, 0.30)';
         ctx.strokeStyle = '#ef5f6b';
@@ -231,6 +233,7 @@ function renderPlan(scene, report = null) {
         ctx.strokeStyle = '#f0a330';
       }
       ctx.fill();
+      drawPoly(r.vertices);
       ctx.lineWidth = 1.6;
       ctx.setLineDash([5, 3]);
       ctx.stroke();
