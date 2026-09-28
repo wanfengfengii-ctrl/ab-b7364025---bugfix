@@ -48,6 +48,14 @@ function scenario(title, input, expect) {
     check(`首个风险形态=${expect.firstShape}`, report.firstRisk?.shape === expect.firstShape,
       `实际 ${report.firstRisk?.shape}`);
   }
+  if (expect.firstArea !== undefined) {
+    check(`首个风险面积≈${expect.firstArea}`, approx(report.firstRisk?.area, expect.firstArea),
+      `实际 ${report.firstRisk?.area}`);
+  }
+  if (expect.riskCount !== undefined) {
+    check(`风险数量=${expect.riskCount}`, report.risks.length === expect.riskCount,
+      `实际 ${report.risks.length}`);
+  }
   if (expect.gapArea !== undefined) {
     check(`漏拍面积≈${expect.gapArea}`, approx(report.stats.gapArea, expect.gapArea),
       `实际 ${report.stats.gapArea}`);
@@ -62,7 +70,9 @@ console.log('== 覆盖认证业务模块 · 冒烟测试 ==');
 
 scenario('合格 · 边界接触（轴对齐）', qualifiedBoundary, { ok: true });
 scenario('合格 · 旋转 30° 条带', qualifiedRotated, { ok: true });
-scenario('风险 · 漏拍（L 形缺口）', riskGap, { ok: false, firstKind: 'gap', gapArea: 164 });
+scenario('风险 · 漏拍（L 形缺口）', riskGap, {
+  ok: false, firstKind: 'gap', gapArea: 164, firstArea: 164, riskCount: 1,
+});
 scenario('风险 · 三重曝光区域', riskTriple, { ok: false, firstKind: 'triple', tripleArea: 300 });
 scenario('风险 · 零面积三重接触点', riskTriplePoint, {
   ok: false, firstKind: 'triple', firstShape: 'point', tripleArea: 0,

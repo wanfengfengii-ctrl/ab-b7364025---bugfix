@@ -142,7 +142,7 @@ describe('合格认证', () => {
 });
 
 describe('漏拍风险', () => {
-  test('竖直漏拍带（含 L 形细分）面积精确', () => {
+  test('连通 L 形漏拍区作为一项完整风险（面积 164，外边界证据）', () => {
     const r = certify({ workarea: square(), strips: [
       { cx: 6, cy: 15, w: 16, h: 34, angle: 0 },
       { cx: 26, cy: 15, w: 12, h: 34, angle: 0 },
@@ -150,10 +150,84 @@ describe('漏拍风险', () => {
     ]});
     assert.equal(r.ok, false);
     assert.ok(Math.abs(r.stats.gapArea - 164) < 1e-6); // 6*30 - 4*4
+    // 连通漏拍区不得被拆成多个风险
+    assert.equal(r.gaps.length, 1);
+    assert.equal(r.risks.length, 1);
+    const g = r.gaps[0];
+    assert.ok(Math.abs(g.area - 164) < 1e-6, `合并后面积 ${g.area}`);
     assert.equal(r.firstRisk.kind, 'gap');
-    assert.ok(Math.abs(r.firstRisk.area - 104) < 1e-6); // 首个（最大）漏拍单元
-    assert.ok(r.firstRisk.boundary.includes('R1·右边'));
-    assert.ok(r.firstRisk.vertices.length >= 3);
+    assert.ok(Math.abs(r.firstRisk.area - 164) < 1e-6); // 首个风险即整个 L 形
+    // L 形外边界 8 个顶点：(14,0)(18,0)(20,0)(20,26)(18,26)(18,30)(20,30)... 取轮廓核对
+    const vertSet = new Set(g.vertices.map(([x, y]) => `${x},${y}`));
+    for (const v of [[14, 0], [18, 0], [20, 0], [20, 26], [18, 26], [18, 30], [20, 30], [14, 26]]) {
+      assert.ok(vertSet.has(`${v[0]},${v[1]}`), `外边界缺少顶点 ${v}`);
+    }
+    assert.equal(g.vertices.length, 8);
+    // 合并轮廓面积与统计面积一致（不自交、无重复）
+    assert.ok(Math.abs(polygonArea(g.vertices) - 164) < 1e-6);
+    // 边界证据只反映实际外边界：外侧覆盖带边与工作区边
+    assert.ok(g.boundary.includes('R1·右边'));   // x=14 整条
+    assert.ok(g.boundary.includes('R2·左边'));   // x=20, y∈[0,26]
+    assert.ok(g.boundary.includes('R3·底边'));   // y=26, x∈[14,18]（凹入处外边界）
+    assert.ok(g.boundary.includes('R3·右边'));   // x=18, y∈[26,30]
+    assert.ok(g.boundary.includes('R3·顶边'));   // y=30, x∈[18,20]
+    assert.ok(g.boundary.includes('工作区·边1')); // 底边
+    assert.ok(g.boundary.includes('工作区·边3')); // 顶边
+    assert.equal(g.boundary.length, 7);
+    // 代表点位于 L 形内部（被切去的角 x∈[18,20],y∈[26,30] 之外）
+    const [rx, ry] = g.representative;
+    assert.ok(rx >= 14 && rx <= 20 && ry >= 0 && ry <= 26);
+  });
+
+  test('彼此独立的漏拍区保持分立报告', () => {
+    // 覆盖带 x∈[10,18] 与 x∈[22,30]，留下两块互不相通的漏拍区
+    const r = certify({ workarea: square(), strips: [
+      { cx: 14, cy: 15, w: 8, h: 34, angle: 0 },
+      { cx: 26, cy: 15, w: 8, h: 34, angle: 0 },
+      { cx: 100, cy: 100, w: 2, h: 2, angle: 0 },
+    ]});
+    assert.equal(r.ok, false);
+    assert.equal(r.gaps.length, 2);
+    const areas = r.gaps.map((g) => g.area).sort((a, b) => a - b);
+    assert.ok(Math.abs(areas[0] - 120) < 1e-6); // x∈[18,22]，4*30
+    assert.ok(Math.abs(areas[1] - 300) < 1e-6); // x∈[0,10]，10*30
+    assert.ok(Math.abs(r.stats.gapArea - 420) < 1e-6);
+    // 首个风险按最小顶点字典序：靠左的大块（含顶点 (0,0)）
+    assert.equal(r.firstRisk.kind, 'gap');
+    assert.ok(Math.abs(r.firstRisk.area - 300) < 1e-6);
+  });
+
+  test('仅点接触的两块漏拍区不被合并（零长度接触不连通）', () => {
+    // 60×60 工作区：左下、右上各被一块覆盖带占据，两块漏拍区仅在 (30,30) 一点相接
+    const r = certify({ workarea: square(60), strips: [
+      { cx: 15, cy: 15, w: 30, h: 30, angle: 0 },
+      { cx: 45, cy: 45, w: 30, h: 30, angle: 0 },
+      { cx: 200, cy: 200, w: 2, h: 2, angle: 0 },
+    ]});
+    assert.equal(r.ok, false);
+    assert.equal(r.gaps.length, 2);
+    assert.ok(Math.abs(r.stats.gapArea - 1800) < 1e-6); // 两块 30*30
+    for (const g of r.gaps) assert.ok(Math.abs(g.area - 900) < 1e-6);
+  });
+
+  test('环绕覆盖岛的连通漏拍区报告为一项，内孔面积不计入漏拍', () => {
+    const r = certify({ workarea: square(), strips: [
+      { cx: 15, cy: 15, w: 6, h: 6, angle: 0 }, // 中央覆盖岛
+      { cx: 100, cy: 100, w: 2, h: 2, angle: 0 },
+      { cx: -100, cy: 100, w: 2, h: 2, angle: 0 },
+    ]});
+    assert.equal(r.ok, false);
+    assert.equal(r.gaps.length, 1);
+    const g = r.gaps[0];
+    assert.ok(Math.abs(g.area - 864) < 1e-6); // 900 - 36
+    assert.equal(g.holes.length, 1);
+    // 内孔即覆盖岛：面积 36，且边界证据含岛的四条边
+    const holeArea = Math.abs(g.holes[0].reduce((a, [x, y], i) => {
+      const q = g.holes[0][(i + 1) % g.holes[0].length];
+      return a + x * q[1] - q[0] * y;
+    }, 0) / 2);
+    assert.ok(Math.abs(holeArea - 36) < 1e-6);
+    assert.ok(g.boundary.includes('R1·底边') && g.boundary.includes('R1·顶边'));
   });
 
   test('完全无覆盖：整个工作区即漏拍区', () => {

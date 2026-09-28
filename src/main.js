@@ -195,6 +195,16 @@ function renderPlan(scene, report = null) {
     ctx.closePath();
   };
 
+  // 风险区域：外环 + 内孔（孔与外环反向绕行走 nonzero 填充，内孔不被涂色）
+  const traceRegion = (r) => {
+    ctx.beginPath();
+    for (const ring of [r.vertices, ...(r.holes || [])]) {
+      if (!ring || ring.length < 3) continue;
+      ring.forEach(([x, y], i) => (i ? ctx.lineTo(X(x), Y(y)) : ctx.moveTo(X(x), Y(y))));
+      ctx.closePath();
+    }
+  };
+
   // 工作区填充
   if (scene.workarea?.length >= 3) {
     drawPoly(scene.workarea);
@@ -222,7 +232,7 @@ function renderPlan(scene, report = null) {
   if (report) {
     for (const r of report.risks) {
       if (r.shape !== 'region') continue;
-      drawPoly(r.vertices);
+      traceRegion(r);
       if (r.kind === 'gap') {
         ctx.fillStyle = 'rgba(239, 95, 107, 0.30)';
         ctx.strokeStyle = '#ef5f6b';
@@ -230,7 +240,7 @@ function renderPlan(scene, report = null) {
         ctx.fillStyle = 'rgba(240, 163, 48, 0.32)';
         ctx.strokeStyle = '#f0a330';
       }
-      ctx.fill();
+      ctx.fill('evenodd');
       ctx.lineWidth = 1.6;
       ctx.setLineDash([5, 3]);
       ctx.stroke();
@@ -249,10 +259,10 @@ function renderPlan(scene, report = null) {
       ctx.moveTo(X(x), Y(y) - 10); ctx.lineTo(X(x), Y(y) + 10);
       ctx.stroke();
     }
-    // 首个风险区域强调：粗虚线框
+    // 首个风险区域强调：粗虚线框（含内孔轮廓）
     const f = report.firstRisk;
     if (f && f.shape === 'region') {
-      drawPoly(f.vertices);
+      traceRegion(f);
       ctx.strokeStyle = '#ff2d55';
       ctx.lineWidth = 3;
       ctx.setLineDash([8, 4]);

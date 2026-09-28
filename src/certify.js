@@ -100,6 +100,198 @@ function sameLine(L1, L2, eps, cTol) {
   );
 }
 
+/* ---------------- 连通区域合并 ---------------- */
+
+/**
+ * 半平面剖分得到的凸单元会把同一块连通漏拍区切碎（例如 L 形区域被
+ * 覆盖带边线切成多个凸单元）。这里仅做拓扑合并，不改变任何连续判定结果：
+ *  1. 收集全部候选单元的有向边（单元均为 CCW），按规范化支撑直线分组；
+ *  2. 同一直线上的端点按投影参数聚类，将边细分为对齐的子段；
+ *  3. 被两个单元以相反方向各经过一次的子段是内部边（抵消），
+ *     并据此用并查集合并「共享正长度边界段」的单元；
+ *  4. 仅被经过一次的子段构成外边界，首尾接合成环（允许凹多边形）。
+ * 仅在点（零长度）处接触的单元不会被合并，彼此独立的漏拍风险保持分立。
+ */
+class DSU {
+  constructor(n) { this.parent = Array.from({ length: n }, (_, i) => i); }
+  find(x) {
+    while (this.parent[x] !== x) {
+      this.parent[x] = this.parent[this.parent[x]];
+      x = this.parent[x];
+    }
+    return x;
+  }
+  union(a, b) {
+    const ra = this.find(a);
+    const rb = this.find(b);
+    if (ra !== rb) this.parent[rb] = ra;
+  }
+}
+
+function numPointKey(x, y, tol) {
+  return `${Math.round(x / tol)},${Math.round(y / tol)}`;
+}
+
+/** 收集单元有向边，按规范化支撑直线分组（直线方向 u 与投影参数 t 一并记录）。 */
+function collectEdgeGroups(cells, tol) {
+  const groups = new Map();
+  cells.forEach((cell, owner) => {
+    const verts = cell.vertices;
+    for (let k = 0; k < verts.length; k++) {
+      const p = verts[k];
+      const q = verts[(k + 1) % verts.length];
+      const px = p.x.toNumber(), py = p.y.toNumber();
+      const qx = q.x.toNumber(), qy = q.y.toNumber();
+      const dx = qx - px, dy = qy - py;
+      const len = Math.hypot(dx, dy);
+      if (len <= tol) continue; // 零长度边：不参与
+      let nx = -dy / len, ny = dx / len; // 左法向
+      if (nx < -1e-11 || (Math.abs(nx) <= 1e-11 && ny < 0)) { nx = -nx; ny = -ny; }
+      const c = nx * px + ny * py;
+      const gkey = `${nx.toFixed(10)}|${ny.toFixed(10)}|${Math.round(c / tol)}`;
+      let g = groups.get(gkey);
+      if (!g) {
+        g = { ux: ny, uy: -nx, ends: [], edges: [] }; // u=(ny,-nx) 为直线方向
+        groups.set(gkey, g);
+      }
+      const tp = g.ux * px + g.uy * py;
+      const tq = g.ux * qx + g.uy * qy;
+      g.edges.push({ p, q, owner, tp, tq });
+      g.ends.push({ t: tp, p }, { t: tq, p: q });
+    }
+  });
+  return groups;
+}
+
+/** 将外边界有向子段接合成环（不含与首点重复的闭合点）；返回所有环。 */
+function stitchLoops(segments, tol) {
+  const keyOf = (p) => numPointKey(p.x.toNumber(), p.y.toNumber(), tol);
+  const byStart = new Map();
+  for (const s of segments) {
+    const sk = keyOf(s.start);
+    if (byStart.has(sk)) return []; // 起点分叉：非简单边界，放弃拓扑合并
+    byStart.set(sk, s);
+  }
+  const remaining = new Set(segments);
+  const loops = [];
+  while (remaining.size) {
+    const first = remaining.values().next().value;
+    const startKey = keyOf(first.start);
+    const ring = [first.start];
+    let cur = first;
+    let ok = true;
+    for (let guard = 0; guard <= segments.length; guard++) {
+      ring.push(cur.end);
+      remaining.delete(cur);
+      if (keyOf(cur.end) === startKey) break;
+      cur = byStart.get(keyOf(cur.end));
+      if (!cur) { ok = false; break; }
+    }
+    // 去掉与首点重复的闭合点；至少 3 个顶点方成环
+    if (ok && ring.length > 3 && keyOf(ring[ring.length - 1]) === startKey) loops.push(ring.slice(0, -1));
+    else break;
+  }
+  return loops;
+}
+
+/**
+ * 把连通（正长度共边）的同类单元合并为区域记录：
+ * @returns {{vertices: object[], holes: object[][], members: number[],
+ *            area: Decimal, centroid: object}[]|null}
+ *   vertices 为外边界环，holes 为内孔环（覆盖岛）；拓扑重建失败时返回 null，
+ *   调用方应回退到逐单元报告，绝不静默产出错误轮廓。
+ */
+function mergeConnectedRegions(cells, tol) {
+  if (cells.length <= 1) {
+    return cells.map((c, i) => ({
+      vertices: c.vertices, holes: [], members: [i],
+      area: c.area, centroid: c.centroid,
+    }));
+  }
+  const groups = collectEdgeGroups(cells, tol);
+  const dsu = new DSU(cells.length);
+  const outer = []; // {start, end, owner} 外边界有向子段
+  for (const g of groups.values()) {
+    // 端点按投影参数聚类
+    g.ends.sort((a, b) => a.t - b.t);
+    const clusters = [];
+    for (const z of g.ends) {
+      const last = clusters[clusters.length - 1];
+      if (last && Math.abs(z.t - last.t) <= tol) continue;
+      clusters.push({ t: z.t, rep: z.p });
+    }
+    const clusterAt = (t) => {
+      let lo = 0, hi = clusters.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (clusters[mid].t < t) lo = mid + 1; else hi = mid;
+      }
+      if (lo > 0 && Math.abs(clusters[lo - 1].t - t) < Math.abs(clusters[lo].t - t)) lo--;
+      return lo;
+    };
+    // 子段 k→k+1：正/反方向各被哪些单元覆盖
+    const cover = new Map();
+    for (const e of g.edges) {
+      const i0 = clusterAt(Math.min(e.tp, e.tq));
+      const i1 = clusterAt(Math.max(e.tp, e.tq));
+      const forward = e.tq >= e.tp;
+      for (let k = i0; k < i1; k++) {
+        let cov = cover.get(k);
+        if (!cov) { cov = { plus: new Set(), minus: new Set() }; cover.set(k, cov); }
+        (forward ? cov.plus : cov.minus).add(e.owner);
+      }
+    }
+    for (const [k, cov] of cover) {
+      const a = clusters[k];
+      const b = clusters[k + 1];
+      if (Math.abs(b.t - a.t) <= tol) continue;
+      if (cov.plus.size && cov.minus.size) {
+        // 内部共边：两侧单元连通
+        for (const x of cov.plus) for (const y of cov.minus) dsu.union(x, y);
+      } else if (cov.plus.size + cov.minus.size === 1) {
+        const forward = cov.plus.size > 0;
+        const owner = (forward ? cov.plus : cov.minus).values().next().value;
+        outer.push({ start: forward ? a.rep : b.rep, end: forward ? b.rep : a.rep, owner });
+      }
+    }
+  }
+
+  // 按连通成分归集外边界并接合为环
+  const byRoot = new Map();
+  for (const seg of outer) {
+    const root = dsu.find(seg.owner);
+    if (!byRoot.has(root)) byRoot.set(root, []);
+    byRoot.get(root).push(seg);
+  }
+  const areaTol = new Decimal(tol).pow(2).mul(1e6);
+  const regions = [];
+  for (const [root, segments] of byRoot) {
+    const loops = stitchLoops(segments, tol);
+    if (!loops.length) return null; // 非流形接合：放弃合并
+    // 面积最大的环为外边界，其余为内孔；外边界 CCW、内孔 CW
+    let outerIdx = 0;
+    for (let i = 1; i < loops.length; i++) {
+      if (signedArea(loops[i]).abs().gt(signedArea(loops[outerIdx]).abs())) outerIdx = i;
+    }
+    const vertices = loops[outerIdx];
+    const holes = loops.filter((_, i) => i !== outerIdx);
+    const members = [];
+    for (let i = 0; i < cells.length; i++) if (dsu.find(i) === root) members.push(i);
+    // 面积取单元面积和（单元内部两两不重叠，不受接合误差影响）
+    let area = new Decimal(0);
+    for (const i of members) area = area.plus(cells[i].area);
+    // 不变量校验：外环面积 − 内孔面积之和 必须等于单元面积和
+    let loopArea = signedArea(vertices).abs();
+    for (const h of holes) loopArea = loopArea.minus(signedArea(h).abs());
+    if (loopArea.minus(area).abs().gt(areaTol)) return null;
+    // 代表点取面积最大成员单元的质心，保证落在区域内部（不会落入内孔）
+    let biggest = members[0];
+    for (const i of members) if (cells[i].area.gt(cells[biggest].area)) biggest = i;
+    regions.push({ vertices, holes, members, area, centroid: cells[biggest].centroid });
+  }
+  return regions;
+}
+
 /* ---------------- 主认证流程 ---------------- */
 
 export function certify(input) {
@@ -227,19 +419,21 @@ export function certify(input) {
   }
   if (vertexMax > stats.maxMultiplicity) stats.maxMultiplicity = vertexMax;
 
-  // 5) 边界证据：单元边 ↔ 边线归属匹配
+  // 5) 边界证据：单元边 ↔ 边线归属匹配（rings 可含外环与内孔环）
   const allLines = [...stripLines, ...waLines];
   const ownerLabel = (o) => (o.workarea ? `工作区·边${o.edge + 1}` : `R${o.strip}·${o.side}`);
-  function boundaryOf(verts) {
+  function boundaryOf(rings) {
     const labels = new Set();
-    for (let i = 0; i < verts.length; i++) {
-      const p = verts[i];
-      const q = verts[(i + 1) % verts.length];
-      const len2 = p.x.minus(q.x).pow(2).plus(p.y.minus(q.y).pow(2));
-      if (len2.lte(lineTol.mul(lineTol))) continue;
-      for (const L of allLines) {
-        if (lineValue(L, p).abs().lte(lineTol) && lineValue(L, q).abs().lte(lineTol)) {
-          for (const o of L.owners) labels.add(ownerLabel(o));
+    for (const verts of rings) {
+      for (let i = 0; i < verts.length; i++) {
+        const p = verts[i];
+        const q = verts[(i + 1) % verts.length];
+        const len2 = p.x.minus(q.x).pow(2).plus(p.y.minus(q.y).pow(2));
+        if (len2.lte(lineTol.mul(lineTol))) continue;
+        for (const L of allLines) {
+          if (lineValue(L, p).abs().lte(lineTol) && lineValue(L, q).abs().lte(lineTol)) {
+            for (const o of L.owners) labels.add(ownerLabel(o));
+          }
         }
       }
     }
@@ -256,17 +450,27 @@ export function certify(input) {
   // 6) 风险区域汇总
   const num = (d) => d.toNumber();
   const vertsOf = (c) => c.vertices.map((p) => [num(p.x), num(p.y)]);
+  const ringOf = (ring) => ring.map((p) => [num(p.x), num(p.y)]);
+  // 漏拍单元先做连通合并：同一连通漏拍区（如 L 形）作为一项完整风险呈现。
+  // 拓扑重建失败时安全回退到逐单元报告（不改变任何判定结论，仅不做聚合）。
+  let gapRegions = mergeConnectedRegions(gapCells, vtxTol.toNumber());
+  if (gapRegions === null) {
+    gapRegions = gapCells.map((c, i) => ({
+      vertices: c.vertices, holes: [], members: [i], area: c.area, centroid: c.centroid,
+    }));
+  }
   const risks = [];
-  gapCells.forEach((c, i) => {
+  gapRegions.forEach((g, i) => {
     risks.push({
       id: `G${i + 1}`,
       kind: 'gap',
       shape: 'region',
       multiplicity: 0,
-      area: num(c.area),
-      representative: [num(c.centroid.x), num(c.centroid.y)],
-      vertices: vertsOf(c),
-      boundary: boundaryOf(c.vertices),
+      area: num(g.area),
+      representative: [num(g.centroid.x), num(g.centroid.y)],
+      vertices: vertsOf(g),
+      holes: g.holes.map(ringOf),
+      boundary: boundaryOf([g.vertices, ...g.holes]),
       strips: [],
     });
   });
@@ -279,7 +483,8 @@ export function certify(input) {
       area: num(c.area),
       representative: [num(c.centroid.x), num(c.centroid.y)],
       vertices: vertsOf(c),
-      boundary: boundaryOf(c.vertices),
+      holes: [],
+      boundary: boundaryOf([c.vertices]),
       strips: c.covering,
     });
   });
@@ -293,6 +498,7 @@ export function certify(input) {
       area: 0,
       representative: p,
       vertices: [p],
+      holes: [],
       boundary: pointEvidence(ct.point),
       strips: ct.covering,
     });
